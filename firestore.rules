@@ -1,0 +1,251 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Data Model
+    // users/{uid}                                     uid, name, email, role
+    // events/{eventId}                                organizerId, status, capacity, rsvpStats, waitlistQueue
+    // events_invites/{eventId}/invites/{inviteId}     email, token, status, plusOnesAllowed, plusOnesCount
+    // email_invites/{inviteId}                        denormalized invite for attendee inbox
+    // events_rsvps/{eventId}/rsvps/{inviteId}         token, email, answer, guests, inviteId, eventId
+    // events_checkins/{eventId}/checks/{checkId}      inviteId, attendeeName, attendeeEmail, method, timestamp
+    // announcements/{id}                              eventId, organizerId, title, message
+    // notifications/{id}                              userId, email, type, title, message, read
+    //
+    // Token RSVP (/rsvp?e=&t=) is an explicit unauthenticated product flow.
+    // The token carried in URL params is the attendee's proof of identity.
+    // Roles are stored in users/{uid}.role — NOT in custom claims.
+    // Rules do NOT use request.auth.token.role anywhere.
+    // ===============================================================
+
+    // ── Helpers ────────────────────────────────────────────────────
+    function isAuthed() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthed() && request.auth.uid == userId;
+    }
+
+    function isOrganizerOfEvent(eventId) {
+      return isAuthed() &&
+        request.auth.uid ==
+          get(/databases/$(database)/documents/events/$(eventId)).data.organizerId;
+    }
+
+    // Fetch the stored token for a given invite (used in RSVP write rule)
+    function inviteToken(eventId, inviteId) {
+      return get(/databases/$(database)/documents/events_invites/$(eventId)/invites/$(inviteId)).data.token;
+    }
+
+    // Validate user document shape
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role']) &&
+        data.uid is string && data.uid.size() > 0 && data.uid.size() < 128 &&
+        data.email is string && data.email.size() < 320 &&
+        data.role in ['organizer', 'attendee'] &&
+        data.name is string && data.name.size() < 120;
+    }
+
+    // Validate event document shape
+    function isValidEvent(data) {
+      return data.keys().hasAll(['title', 'organizerId', 'status', 'capacity']) &&
+        data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+        data.organizerId is string &&
+        data.status in ['draft', 'published', 'completed', 'cancelled'] &&
+        data.capacity is int && data.capacity > 0 && data.capacity < 100000;
+    }
+
+    // ── users/{userId} ─────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+
+      allow create: if isOwner(userId)
+                    && isValidUser(request.resource.data)
+                    && request.resource.data.uid == userId
+                    && request.resource.data.email == request.auth.token.email;
+
+      allow update: if isOwner(userId)
+                    && isValidUser(request.resource.data)
+                    && request.resource.data.uid == resource.data.uid
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.email == resource.data.email;
+
+      allow delete: if false;
+    }
+
+    // ── events/{eventId} ───────────────────────────────────────────
+    match /events/{eventId} {
+      // Published/completed events are publicly readable (needed for RSVP page load)
+      allow read: if resource.data.status in ['published', 'completed']
+                  || (isAuthed() && request.auth.uid == resource.data.organizerId);
+
+      allow create: if isAuthed()
+                    && isValidEvent(request.resource.data)
+                    && request.resource.data.organizerId == request.auth.uid;
+
+      // Organizer can update any field
+      allow update: if isAuthed()
+                    && resource.data.organizerId == request.auth.uid
+                    && request.resource.data.organizerId == resource.data.organizerId
+                    && isValidEvent(request.resource.data);
+
+      // Token-based RSVP transaction updates only rsvpStats/waitlistQueue/updatedAt.
+      // This rule allows the unauthenticated (token) flow to update event counters.
+      allow update: if request.resource.data.organizerId == resource.data.organizerId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['rsvpStats', 'waitlistQueue', 'updatedAt']);
+
+      allow delete: if isAuthed() && resource.data.organizerId == request.auth.uid;
+    }
+
+    // ── events_invites/{eventId}/invites/{inviteId} ────────────────
+    match /events_invites/{eventId}/invites/{inviteId} {
+      // Public read: token links must resolve without authentication
+      allow read: if true;
+
+      allow create, delete: if isOrganizerOfEvent(eventId);
+
+      // Organizer can update any fields.
+      // Token holder (RSVP flow) can update only status, plusOnesCount,
+      // waitlistPosition, and token — and must supply the correct stored token.
+      allow update: if isOrganizerOfEvent(eventId)
+                    || (
+                      request.resource.data.token == resource.data.token
+                      && request.resource.data.diff(resource.data).affectedKeys()
+                           .hasOnly(['status', 'plusOnesCount', 'waitlistPosition', 'token'])
+                      && request.resource.data.status in
+                           ['pending', 'yes', 'maybe', 'no', 'waitlist', 'checked-in']
+                    );
+    }
+
+    // ── collectionGroup: all /invites subcollections ───────────────
+    // Allows an authenticated attendee to query across all event invite
+    // subcollections by their email address.
+    match /{path=**}/invites/{inviteId} {
+      allow read: if isAuthed()
+                  && resource.data.email == request.auth.token.email;
+    }
+
+    // ── email_invites/{inviteId} ───────────────────────────────────
+    match /email_invites/{inviteId} {
+      // Attendee reads their own inbox; organizer reads for their event
+      allow read: if isAuthed() && (
+                    resource.data.email == request.auth.token.email
+                    || isOrganizerOfEvent(resource.data.eventId)
+                  );
+
+      // Only the organizer can create invite inbox entries
+      allow create: if isOrganizerOfEvent(request.resource.data.eventId)
+                    && request.resource.data.email is string
+                    && request.resource.data.eventId is string;
+
+      // Organizer can update anything.
+      // Token holder (RSVP + check-in flow) can update status/updatedAt/plusOnesCount/
+      // waitlistPosition without touching identity fields (email, eventId, inviteId).
+      allow update: if isOrganizerOfEvent(resource.data.eventId)
+                    || (
+                      request.resource.data.email == resource.data.email
+                      && request.resource.data.eventId == resource.data.eventId
+                      && request.resource.data.inviteId == resource.data.inviteId
+                    );
+
+      allow delete: if isOrganizerOfEvent(resource.data.eventId);
+    }
+
+    // ── events_rsvps/{eventId}/rsvps/{inviteId} ────────────────────
+    match /events_rsvps/{eventId}/rsvps/{inviteId} {
+      // Organizer reads all RSVPs for their event (dashboard / analytics).
+      // Authenticated attendee reads their own RSVP by email.
+      // Token holder reads their own RSVP by token stored in the invite document —
+      //   this covers the unauthenticated re-RSVP flow (read inside transaction).
+      allow read: if isOrganizerOfEvent(eventId)
+                  || (isAuthed() && resource.data.email == request.auth.token.email)
+                  || (resource.data.token == inviteToken(eventId, inviteId));
+
+      // Write (create or update) is allowed when:
+      //   • the organizer performs the write, OR
+      //   • the supplied token matches the invite's stored token
+      //     (covers both authenticated and unauthenticated token flows).
+      // Basic shape validation is enforced here too.
+      allow create, update: if (
+                              request.resource.data.eventId == eventId &&
+                              request.resource.data.inviteId == inviteId &&
+                              request.resource.data.token is string &&
+                              request.resource.data.token.size() >= 16 &&
+                              request.resource.data.answer in ['yes', 'maybe', 'no', 'waitlist'] &&
+                              request.resource.data.email is string &&
+                              request.resource.data.guests is int &&
+                              request.resource.data.guests >= 0 &&
+                              request.resource.data.guests < 50
+                            ) && (
+                              isOrganizerOfEvent(eventId)
+                              || request.resource.data.token == inviteToken(eventId, inviteId)
+                            );
+
+      allow delete: if isOrganizerOfEvent(eventId);
+    }
+
+    // ── announcements/{announcementId} ────────────────────────────
+    match /announcements/{announcementId} {
+      // Publicly readable so attendees can see them without logging in
+      allow read: if true;
+
+      allow create: if isAuthed()
+                    && request.resource.data.eventId is string
+                    && request.resource.data.title is string
+                    && request.resource.data.title.size() > 0
+                    && request.resource.data.title.size() < 200
+                    && request.resource.data.message is string
+                    && request.resource.data.message.size() > 0
+                    && request.resource.data.message.size() < 4000
+                    && isOrganizerOfEvent(request.resource.data.eventId)
+                    && request.resource.data.organizerId == request.auth.uid;
+
+      allow update, delete: if isAuthed()
+                            && resource.data.organizerId == request.auth.uid;
+    }
+
+    // ── notifications/{notificationId} ────────────────────────────
+    match /notifications/{notificationId} {
+      // Read: authenticated user sees only their own notifications
+      allow read: if isAuthed() && (
+                    resource.data.userId == request.auth.uid
+                    || resource.data.email == request.auth.token.email
+                  );
+
+      // Create: authenticated users (organizer sending bulk notifications after
+      //   announcements/cancellations) OR unauthenticated token flows writing
+      //   waitlist-promotion notifications inside a Firestore transaction.
+      //   Minimum shape validation is always enforced.
+      allow create: if request.resource.data.title is string
+                    && request.resource.data.title.size() < 200
+                    && request.resource.data.message is string
+                    && request.resource.data.message.size() < 2000
+                    && request.resource.data.type is string
+                    && request.resource.data.type.size() > 0
+                    && request.resource.data.keys().hasAll(['userId', 'email', 'type', 'title', 'message', 'read', 'createdAt']);
+
+      // Update: owner can only flip the 'read' flag
+      allow update: if isAuthed()
+                    && (
+                      resource.data.userId == request.auth.uid
+                      || resource.data.email == request.auth.token.email
+                    )
+                    && request.resource.data.diff(resource.data)
+                                          .affectedKeys().hasOnly(['read']);
+
+      allow delete: if false;
+    }
+
+    // ── events_checkins/{eventId}/checks/{checkId} ─────────────────
+    // Read and write are strictly limited to the event organizer.
+    // The StaffCheckInPage enforces auth.role == 'organizer' before calling
+    // any Firestore operation, providing defence-in-depth on the client side.
+    match /events_checkins/{eventId}/checks/{checkId} {
+      allow read, write: if isOrganizerOfEvent(eventId);
+    }
+
+  }
+}

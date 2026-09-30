@@ -1,0 +1,35 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "invites",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "email", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "invites",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "token", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "rsvps",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "answer",    "order": "ASCENDING"  },
+        { "fieldPath": "timestamp", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "notifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "userId",    "order": "ASCENDING"  },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

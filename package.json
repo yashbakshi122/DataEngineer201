@@ -1,0 +1,35 @@
+{
+  "name": "real-time-cloud-based-event-planning---rsvp-tracker",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/vite/bin/vite.js",
+    "build": "node node_modules/typescript/bin/tsc -b && node node_modules/vite/bin/vite.js build",
+    "lint": "oxlint",
+    "preview": "node node_modules/vite/bin/vite.js preview",
+    "test": "node scripts/testSuite.js",
+    "deploy:rules": "firebase deploy --only firestore:rules",
+    "deploy:functions": "firebase deploy --only functions",
+    "deploy:all": "firebase deploy"
+  },
+  "dependencies": {
+    "firebase": "^12.19.0",
+    "lucide-react": "^1.48.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.4",
+    "recharts": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}
